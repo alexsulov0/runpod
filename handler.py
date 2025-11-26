@@ -4,6 +4,7 @@ import time
 import logging
 from typing import Dict, Any
 
+import torch
 import runpod
 
 # Add src to path
@@ -105,9 +106,12 @@ def handler(event: Dict[str, Any]):
         batch_size = input_data["batch_size"]
         start_nonce = input_data["start_nonce"]
         params_dict = input_data["params"]
-        devices = input_data["devices"]
 
-        logger.info(f"START: block={block_height}, batch_size={batch_size}, start={start_nonce}")
+        # Auto-detect all available GPUs (ignore client's devices parameter)
+        gpu_count = torch.cuda.device_count()
+        devices = [f"cuda:{i}" for i in range(gpu_count)]
+
+        logger.info(f"START: block={block_height}, batch_size={batch_size}, start={start_nonce}, gpus={gpu_count}")
 
         # Initialize compute
         compute = initialize_compute(
