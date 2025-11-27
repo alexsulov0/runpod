@@ -2,9 +2,11 @@ from abc import (
     ABC,
     abstractmethod,
 )
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import (
     List,
     Tuple,
+    Optional,
 )
 
 import numpy as np
@@ -36,7 +38,9 @@ class BaseCompute(ABC):
         nonces: List[int],
         public_key: str,
         target: np.ndarray,
-    ) -> ProofBatch:
+        next_nonces: List[int] = None,
+        use_cache: bool = False,
+    ) -> Future[ProofBatch]:
         pass
 
     @abstractmethod
@@ -65,7 +69,7 @@ class Compute(BaseCompute):
         self.params = params
         self.stats = Stats()
         self.devices = devices
-        
+
         self.model = ModelWrapper.build(
             hash_=self.block_hash,
             params=params,
@@ -78,27 +82,59 @@ class Compute(BaseCompute):
             self.params.vocab_size
         )
         self.node_id = node_id
-        
+
+        # ThreadPoolExecutor for parallel input generation and post-processing
+        self.executor = ThreadPoolExecutor(max_workers=24)
+        self.next_batch_future: Optional[Future] = None
+        self.next_public_key: Optional[str] = None
+
     def _prepare_batch(
         self,
         nonces: List[int],
         public_key: str,
+        thread_batch_size: int = 256,
     ) -> Tuple[torch.Tensor, np.ndarray]:
-        with self.stats.time_stats.time_gen_inputs():
-            inputs = get_inputs(
+        """Prepare batch with parallel input generation"""
+        nonce_batches = [
+            nonces[i: i + thread_batch_size]
+            for i in range(0, len(nonces), thread_batch_size)
+        ]
+
+        def get_inputs_batch(nonce_batch):
+            return get_inputs(
                 self.block_hash,
                 public_key,
-                nonces,
+                nonce_batch,
                 dim=self.params.dim,
                 seq_len=self.params.seq_len,
             )
 
-        with self.stats.time_stats.time_gen_perms():
-            permutations = get_permutations(
+        def get_permutations_batch(nonce_batch):
+            return get_permutations(
                 self.block_hash,
                 public_key,
-                nonces,
+                nonce_batch,
                 dim=self.params.vocab_size
+            )
+
+        with self.stats.time_stats.time_gen_inputs():
+            inputs = self.executor.map(
+                get_inputs_batch,
+                nonce_batches
+            )
+            inputs = torch.cat(
+                list(inputs),
+                dim=0
+            )
+
+        with self.stats.time_stats.time_gen_perms():
+            permutations = self.executor.map(
+                get_permutations_batch,
+                nonce_batches
+            )
+            permutations = np.concatenate(
+                list(permutations),
+                axis=0
             )
 
         return inputs, permutations
@@ -110,7 +146,7 @@ class Compute(BaseCompute):
         target: np.ndarray,
         nonces: List[int],
         public_key: str = None,
-    ) -> ProofBatch:
+    ) -> Future[ProofBatch]:
         if public_key is None:
             public_key = self.public_key
 
@@ -124,37 +160,89 @@ class Compute(BaseCompute):
                 outputs = outputs[:, -1, :].cpu().numpy()
         del inputs
 
-        with self.stats.time_stats.time_perm():
-            batch_indices = np.arange(outputs.shape[0])[:, None]
-            outputs = outputs[batch_indices, permutations]
+        def get_batch(outputs):
+            with self.stats.time_stats.time_perm():
+                batch_indices = np.arange(outputs.shape[0])[:, None]
+                outputs = outputs[batch_indices, permutations]
 
-        with self.stats.time_stats.time_process():
-            outputs = outputs / np.linalg.norm(outputs, axis=1, keepdims=True)
-            distances = np.linalg.norm(
-                outputs - target,
-                axis=1
-            )
-            batch = ProofBatch(
-                public_key=public_key,
-                block_hash=self.block_hash,
-                block_height=self.block_height,
-                nonces=nonces,
-                dist=distances.tolist(),
-                node_id=self.node_id,
-            )
+            with self.stats.time_stats.time_process():
+                outputs = outputs / np.linalg.norm(outputs, axis=1, keepdims=True)
+                distances = np.linalg.norm(
+                    outputs - target,
+                    axis=1
+                )
+                batch = ProofBatch(
+                    public_key=public_key,
+                    block_hash=self.block_hash,
+                    block_height=self.block_height,
+                    nonces=nonces,
+                    dist=distances,
+                    node_id=self.node_id,
+                )
 
-        return batch
+            return batch
+
+        return self.executor.submit(
+            get_batch,
+            outputs
+        )
 
     def __call__(
         self,
         nonces: List[int],
         public_key: str,
         target: np.ndarray,
+        next_nonces: List[int] = None,
+        use_cache: bool = False,
+    ) -> Future[ProofBatch]:
+        """
+        Process a batch of nonces with optional pre-fetching.
+
+        Args:
+            nonces: Current batch of nonces to process
+            public_key: Public key for this batch
+            target: Target vector for distance calculation
+            next_nonces: Next batch of nonces to pre-fetch (optional)
+            use_cache: Whether to use cached pre-fetched data
+
+        Returns:
+            Future[ProofBatch] - async result
+        """
+        with self.stats.time_stats.time_total_gen():
+            # Use pre-fetched batch if available and valid
+            if (
+                use_cache
+                and self.next_batch_future is not None
+                and self.next_public_key == public_key
+            ):
+                inputs, permutations = self.next_batch_future.result()
+            else:
+                inputs, permutations = self._prepare_batch(nonces, public_key)
+
+            # Pre-fetch next batch while processing current one
+            if next_nonces is not None:
+                self.next_batch_future = self.executor.submit(
+                    self._prepare_batch, next_nonces, public_key
+                )
+                self.next_public_key = public_key
+            else:
+                self.next_batch_future = None
+                self.next_public_key = None
+
+        return self._process_batch(inputs, permutations, target, nonces, public_key)
+
+    def call_sync(
+        self,
+        nonces: List[int],
+        public_key: str,
+        target: np.ndarray,
     ) -> ProofBatch:
+        """Synchronous version without pre-fetching (for simple use cases)"""
         with self.stats.time_stats.time_total_gen():
             inputs, permutations = self._prepare_batch(nonces, public_key)
 
-        return self._process_batch(inputs, permutations, target, nonces, public_key)
+        future = self._process_batch(inputs, permutations, target, nonces, public_key)
+        return future.result()
 
     def validate(
         self,
@@ -171,5 +259,10 @@ class Compute(BaseCompute):
             nonces=nonces,
             public_key=proof_batch.public_key,
             target=target_to_validate,
-        )
+            next_nonces=None,
+        ).result()
         return proof_batch
+
+    def shutdown(self):
+        """Shutdown the executor"""
+        self.executor.shutdown(wait=False)
