@@ -260,16 +260,19 @@ def generation_handler(
         logger.info(f"Detected {gpu_count} GPUs")
 
         # Detect GPU architecture for optimizations
+        recommended_dtype = torch.float16  # default
         try:
             gpu_caps = get_gpu_architecture(0)
             arch_config = get_architecture_config(0)
+            recommended_dtype = gpu_caps.recommended_dtype
             logger.info(
                 f"GPU Architecture: {gpu_caps.device_name} "
                 f"({gpu_caps.architecture.value}, SM{gpu_caps.compute_capability[0]}{gpu_caps.compute_capability[1]})"
             )
             logger.info(
                 f"  Memory: {gpu_caps.total_memory_gb:.1f}GB, "
-                f"FP8: {gpu_caps.supports_fp8}, BF16: {gpu_caps.supports_bfloat16}"
+                f"FP8: {gpu_caps.supports_fp8}, BF16: {gpu_caps.supports_bfloat16}, "
+                f"dtype: {recommended_dtype}"
             )
 
             # Enable FP8 for Blackwell GPUs
@@ -313,12 +316,13 @@ def generation_handler(
         gpu_group_devices = [group.get_device_strings() for group in gpu_groups]
 
         # Build base model ONCE on GPU 0 (this is the slow part)
-        logger.info("Building base model on GPU 0...")
+        logger.info(f"Building base model on GPU 0 with dtype={recommended_dtype}...")
         base_model_start = time.time()
         base_model_data = ModelWrapper.build_base_model(
             hash_=block_hash,
             params=params,
             max_seq_len=params.seq_len,
+            dtype=recommended_dtype,
         )
         logger.info(f"Base model built in {time.time() - base_model_start:.1f}s")
 
